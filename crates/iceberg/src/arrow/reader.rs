@@ -1390,9 +1390,15 @@ impl<R: FileRead> AsyncFileReader for ArrowFileReader<R> {
         async move {
             let reader = ParquetMetaDataReader::new()
                 .with_prefetch_hint(self.metadata_size_hint)
-                .with_column_indexes(self.preload_column_index)
-                .with_page_indexes(self.preload_page_index)
-                .with_offset_indexes(self.preload_offset_index);
+                .with_column_index_policy(parquet::file::metadata::PageIndexPolicy::from(
+                    self.preload_column_index,
+                ))
+                .with_page_index_policy(parquet::file::metadata::PageIndexPolicy::from(
+                    self.preload_page_index,
+                ))
+                .with_offset_index_policy(parquet::file::metadata::PageIndexPolicy::from(
+                    self.preload_offset_index,
+                ));
             let size = self.meta.size;
             let meta = reader.load_and_finish(self, size).await?;
 
