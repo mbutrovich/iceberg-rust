@@ -64,6 +64,7 @@ pub struct ArrowReaderBuilder {
     concurrency_limit_data_files: usize,
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
+    arrow_reader_options: Option<ArrowReaderOptions>,
 }
 
 impl ArrowReaderBuilder {
@@ -77,6 +78,7 @@ impl ArrowReaderBuilder {
             concurrency_limit_data_files: num_cpus,
             row_group_filtering_enabled: true,
             row_selection_enabled: false,
+            arrow_reader_options: None,
         }
     }
 
@@ -105,6 +107,13 @@ impl ArrowReaderBuilder {
         self
     }
 
+    /// Provide custom ArrowReaderOptions for Parquet reading.
+    /// Use this to configure schema hints (e.g., for INT96 handling).
+    pub fn with_arrow_reader_options(mut self, options: ArrowReaderOptions) -> Self {
+        self.arrow_reader_options = Some(options);
+        self
+    }
+
     /// Build the ArrowReader.
     pub fn build(self) -> ArrowReader {
         ArrowReader {
@@ -117,6 +126,7 @@ impl ArrowReaderBuilder {
             concurrency_limit_data_files: self.concurrency_limit_data_files,
             row_group_filtering_enabled: self.row_group_filtering_enabled,
             row_selection_enabled: self.row_selection_enabled,
+            arrow_reader_options: self.arrow_reader_options,
         }
     }
 }
@@ -133,6 +143,7 @@ pub struct ArrowReader {
 
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
+    arrow_reader_options: Option<ArrowReaderOptions>,
 }
 
 impl ArrowReader {
@@ -144,6 +155,7 @@ impl ArrowReader {
         let concurrency_limit_data_files = self.concurrency_limit_data_files;
         let row_group_filtering_enabled = self.row_group_filtering_enabled;
         let row_selection_enabled = self.row_selection_enabled;
+        let arrow_reader_options = self.arrow_reader_options.clone();
 
         let stream = tasks
             .map_ok(move |task| {
@@ -156,6 +168,7 @@ impl ArrowReader {
                     self.delete_file_loader.clone(),
                     row_group_filtering_enabled,
                     row_selection_enabled,
+                    arrow_reader_options.clone(),
                 )
             })
             .map_err(|err| {
@@ -175,6 +188,7 @@ impl ArrowReader {
         delete_file_loader: CachingDeleteFileLoader,
         row_group_filtering_enabled: bool,
         row_selection_enabled: bool,
+        arrow_reader_options: Option<ArrowReaderOptions>,
     ) -> Result<ArrowRecordBatchStream> {
         let should_load_page_index =
             (row_selection_enabled && task.predicate.is_some()) || !task.deletes.is_empty();
@@ -185,6 +199,7 @@ impl ArrowReader {
             &task.data_file_path,
             file_io.clone(),
             should_load_page_index,
+            arrow_reader_options,
         )
         .await?;
 
@@ -327,6 +342,7 @@ impl ArrowReader {
         data_file_path: &str,
         file_io: FileIO,
         should_load_page_index: bool,
+        arrow_reader_options: Option<ArrowReaderOptions>,
     ) -> Result<ParquetRecordBatchStreamBuilder<ArrowFileReader<impl FileRead + Sized>>> {
         // Get the metadata for the Parquet file we need to read and build
         // a reader for the data within
@@ -339,11 +355,9 @@ impl ArrowReader {
             .with_preload_page_index(should_load_page_index);
 
         // Create the record batch stream builder, which wraps the parquet file reader
-        let record_batch_stream_builder = ParquetRecordBatchStreamBuilder::new_with_options(
-            parquet_file_reader,
-            ArrowReaderOptions::new(),
-        )
-        .await?;
+        let options = arrow_reader_options.unwrap_or_else(ArrowReaderOptions::new);
+        let record_batch_stream_builder =
+            ParquetRecordBatchStreamBuilder::new_with_options(parquet_file_reader, options).await?;
         Ok(record_batch_stream_builder)
     }
 
