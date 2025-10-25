@@ -849,7 +849,7 @@ mod tests {
             file_path: eq_delete_path.clone(),
             file_type: DataContentType::EqualityDeletes,
             partition_spec_id: 0,
-            equality_ids: Some(vec![2, 3, 4, 6]), // field IDs from the equality delete schema
+            equality_ids: Some(vec![2, 3]), // Only use field IDs that exist in both schemas
         };
 
         let file_scan_task = FileScanTask {

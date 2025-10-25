@@ -247,7 +247,7 @@ impl PartitionValueCalculator {
         }
 
         let struct_array = StructArray::try_new(expected_struct_fields, partition_values, None)
-            .map_err(|e| DataFusionError::ArrowError(e, None))?;
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
 
         Ok(Arc::new(struct_array))
     }
