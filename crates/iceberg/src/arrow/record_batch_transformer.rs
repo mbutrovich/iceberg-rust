@@ -300,14 +300,25 @@ impl RecordBatchTransformer {
             )?;
             let target_type = target_field.data_type();
 
-            // Fields with initial_default are partition columns - always use constant values.
-            // Per spec (Scan Planning: "Return value from partition metadata for Identity transforms").
-            // See Iceberg Java: BaseParquetReaders.java uses PartitionUtil.constantsMap() for this.
             let iceberg_field = snapshot_schema.field_by_id(*field_id).ok_or(
                 Error::new(ErrorKind::Unexpected, "Field not found in snapshot schema")
             )?;
 
-            let column_source = if iceberg_field.initial_default.is_some() {
+            // Check if this field is present in the Parquet file
+            let is_in_parquet = if has_field_id_conflict {
+                name_to_source_schema_map.contains_key(iceberg_field.name.as_str())
+            } else {
+                field_id_to_source_schema_map.contains_key(field_id)
+            };
+
+            // Fields with initial_default that are NOT in Parquet are partition columns
+            // (common in add_files scenario where partition columns are in directory paths).
+            // Per spec (Scan Planning: "Return value from partition metadata for Identity transforms").
+            // See Iceberg Java: BaseParquetReaders.java uses PartitionUtil.constantsMap() for this.
+            //
+            // Fields with initial_default that ARE in Parquet should be read normally
+            // (e.g., source columns for bucket partitioning like 'id' in PARTITIONED BY bucket(4, id)).
+            let column_source = if iceberg_field.initial_default.is_some() && !is_in_parquet {
                 // This is a partition column - use the constant value, don't read from file
                 let default_value = if let Some(iceberg_default_value) = &iceberg_field.initial_default {
                     let Literal::Primitive(primitive_literal) = iceberg_default_value else {
