@@ -304,12 +304,24 @@ impl RecordBatchTransformer {
                 Error::new(ErrorKind::Unexpected, "Field not found in snapshot schema")
             )?;
 
-            // Check if this field is present in the Parquet file
-            let is_in_parquet = if has_field_id_conflict {
-                name_to_source_schema_map.contains_key(iceberg_field.name.as_str())
-            } else {
-                field_id_to_source_schema_map.contains_key(field_id)
-            };
+            // Must use field ID to check presence in Parquet because:
+            // 1. Column renames change names but preserve field IDs
+            // 2. If we used name-based lookup, renamed columns would be incorrectly identified as
+            //    "not in Parquet" and treated as partition columns with constant values
+            // 3. This would break filter pushdown - filters couldn't be mapped to Parquet columns
+            //
+            // Name-based lookup is only used later when actually reading data in add_files scenarios
+            // where partition column field IDs conflict with data column field IDs.
+            let is_in_parquet = field_id_to_source_schema_map.contains_key(field_id);
+
+            eprintln!(
+                "Field ID {} (name: {}) - has_field_id_conflict: {}, is_in_parquet: {}, initial_default: {}",
+                field_id,
+                iceberg_field.name,
+                has_field_id_conflict,
+                is_in_parquet,
+                iceberg_field.initial_default.is_some()
+            );
 
             // Fields with initial_default that are NOT in Parquet are partition columns
             // (common in add_files scenario where partition columns are in directory paths).
@@ -337,14 +349,27 @@ impl RecordBatchTransformer {
                     target_type: target_type.clone(),
                 }
             } else {
-                // For data columns (no initial_default), check if we need to use name-based or field ID-based mapping
-                let source_info = if has_field_id_conflict {
-                    // Use name-based mapping when partition columns conflict with Parquet field IDs
+                // Field has initial_default but IS in Parquet, OR field has no initial_default
+                eprintln!("Field ID {} (name: {}) - choosing mapping strategy", field_id, iceberg_field.name);
+
+                // If field has initial_default AND is in Parquet, it's a source column for partitioning
+                // (like 'id' in PARTITIONED BY bucket(8, id)) - must use field ID mapping to handle renames
+                let use_field_id_mapping = iceberg_field.initial_default.is_some() && is_in_parquet;
+
+                let source_info = if use_field_id_mapping {
+                    // Source column for partition transform - always use field ID (handles renames correctly)
+                    eprintln!("  -> Using field ID mapping (source column for partitioning)");
+                    field_id_to_source_schema_map.get(field_id)
+                } else if has_field_id_conflict {
+                    // Regular data column with field ID conflict - use name-based mapping
+                    eprintln!("  -> Using name-based mapping (has_field_id_conflict=true)");
                     name_to_source_schema_map.get(iceberg_field.name.as_str())
                 } else {
-                    // Use field ID-based mapping (normal case)
+                    // Regular data column - use field ID mapping (normal case)
+                    eprintln!("  -> Using field ID-based mapping (has_field_id_conflict=false)");
                     field_id_to_source_schema_map.get(field_id)
                 };
+                eprintln!("  -> source_info found: {}", source_info.is_some());
 
                 if let Some((source_field, source_index)) = source_info {
                     // column present in source
