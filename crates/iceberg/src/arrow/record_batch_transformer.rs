@@ -314,15 +314,6 @@ impl RecordBatchTransformer {
             // where partition column field IDs conflict with data column field IDs.
             let is_in_parquet = field_id_to_source_schema_map.contains_key(field_id);
 
-            eprintln!(
-                "Field ID {} (name: {}) - has_field_id_conflict: {}, is_in_parquet: {}, initial_default: {}",
-                field_id,
-                iceberg_field.name,
-                has_field_id_conflict,
-                is_in_parquet,
-                iceberg_field.initial_default.is_some()
-            );
-
             // Fields with initial_default that are NOT in Parquet are partition columns
             // (common in add_files scenario where partition columns are in directory paths).
             // Per spec (Scan Planning: "Return value from partition metadata for Identity transforms").
@@ -350,26 +341,23 @@ impl RecordBatchTransformer {
                 }
             } else {
                 // Field has initial_default but IS in Parquet, OR field has no initial_default
-                eprintln!("Field ID {} (name: {}) - choosing mapping strategy", field_id, iceberg_field.name);
 
                 // If field has initial_default AND is in Parquet, it's a source column for partitioning
-                // (like 'id' in PARTITIONED BY bucket(8, id)) - must use field ID mapping to handle renames
+                // (like 'id' in PARTITIONED BY bucket(8, id)) - must use field ID mapping to handle renames.
+                // This is a workaround since Rust FileScanTask doesn't have partition data/spec like Java.
+                // TODO: Add partition data and PartitionSpec to FileScanTask to build proper constantsMap.
                 let use_field_id_mapping = iceberg_field.initial_default.is_some() && is_in_parquet;
 
                 let source_info = if use_field_id_mapping {
                     // Source column for partition transform - always use field ID (handles renames correctly)
-                    eprintln!("  -> Using field ID mapping (source column for partitioning)");
                     field_id_to_source_schema_map.get(field_id)
                 } else if has_field_id_conflict {
                     // Regular data column with field ID conflict - use name-based mapping
-                    eprintln!("  -> Using name-based mapping (has_field_id_conflict=true)");
                     name_to_source_schema_map.get(iceberg_field.name.as_str())
                 } else {
                     // Regular data column - use field ID mapping (normal case)
-                    eprintln!("  -> Using field ID-based mapping (has_field_id_conflict=false)");
                     field_id_to_source_schema_map.get(field_id)
                 };
-                eprintln!("  -> source_info found: {}", source_info.is_some());
 
                 if let Some((source_field, source_index)) = source_info {
                     // column present in source
