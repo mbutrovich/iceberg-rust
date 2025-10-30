@@ -15,12 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::sync::Arc;
+
 use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 
 use crate::Result;
 use crate::expr::BoundPredicate;
-use crate::spec::{DataContentType, DataFileFormat, ManifestEntryRef, Schema, SchemaRef};
+use crate::spec::{
+    DataContentType, DataFileFormat, ManifestEntryRef, PartitionSpec, Schema, SchemaRef, Struct,
+};
 
 /// A stream of [`FileScanTask`].
 pub type FileScanTaskStream = BoxStream<'static, Result<FileScanTask>>;
@@ -54,6 +58,19 @@ pub struct FileScanTask {
 
     /// The list of delete files that may need to be applied to this data file
     pub deletes: Vec<FileScanTaskDeleteFile>,
+
+    /// Partition data tuple from the manifest entry.
+    /// Schema based on the partition spec, using partition field ids for struct field ids.
+    #[serde(skip)]
+    pub partition: Option<Struct>,
+
+    /// The partition spec ID for this file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partition_spec_id: Option<i32>,
+
+    /// The partition spec for this file (for computing constants from partition data).
+    #[serde(skip)]
+    pub partition_spec: Option<Arc<PartitionSpec>>,
 }
 
 impl FileScanTask {

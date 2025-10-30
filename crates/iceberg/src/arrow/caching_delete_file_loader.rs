@@ -881,6 +881,9 @@ mod tests {
             project_field_ids: vec![2, 3],
             predicate: None,
             deletes: vec![pos_del, eq_del],
+            partition: None,
+            partition_spec_id: None,
+            partition_spec: None,
         };
 
         // Load the deletes - should handle both types without error

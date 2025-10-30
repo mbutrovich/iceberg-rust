@@ -1793,7 +1793,7 @@ impl Literal {
 
 /// The partition struct stores the tuple of partition values for each file.
 /// Its type is derived from the partition fields of the partition spec used to write the manifest file.
-/// In v2, the partition struct’s field ids must match the ids from the partition spec.
+/// In v2, the partition struct's field ids must match the ids from the partition spec.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Struct {
     /// Vector to store the field values
