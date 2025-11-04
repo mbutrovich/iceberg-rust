@@ -243,6 +243,7 @@ impl ArrowReader {
                     task.project_field_ids(),
                     task.partition_spec.clone(),
                     task.partition.clone(),
+                    task.name_mapping.clone(),
                 )
             } else {
                 // Fallback to build without partition data
@@ -1963,6 +1964,7 @@ message schema {
                 deletes: vec![],
                 partition: None,
                 partition_spec: None,
+            name_mapping: None,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -2283,6 +2285,7 @@ message schema {
             deletes: vec![],
             partition: None,
             partition_spec: None,
+            name_mapping: None,
         };
 
         // Task 2: read the second and third row groups
@@ -2298,6 +2301,7 @@ message schema {
             deletes: vec![],
             partition: None,
             partition_spec: None,
+            name_mapping: None,
         };
 
         let tasks1 = Box::pin(futures::stream::iter(vec![Ok(task1)])) as FileScanTaskStream;
@@ -2429,6 +2433,7 @@ message schema {
                 deletes: vec![],
                 partition: None,
                 partition_spec: None,
+            name_mapping: None,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -2599,6 +2604,7 @@ message schema {
             }],
             partition: None,
             partition_spec: None,
+            name_mapping: None,
         };
 
         let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
@@ -2816,6 +2822,7 @@ message schema {
             }],
             partition: None,
             partition_spec: None,
+            name_mapping: None,
         };
 
         let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
@@ -3027,6 +3034,7 @@ message schema {
             }],
             partition: None,
             partition_spec: None,
+            name_mapping: None,
         };
 
         let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
@@ -3129,6 +3137,7 @@ message schema {
                 deletes: vec![],
                 partition: None,
                 partition_spec: None,
+            name_mapping: None,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -3225,6 +3234,7 @@ message schema {
                 deletes: vec![],
                 partition: None,
                 partition_spec: None,
+            name_mapping: None,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -3310,6 +3320,7 @@ message schema {
                 deletes: vec![],
                 partition: None,
                 partition_spec: None,
+            name_mapping: None,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -3409,6 +3420,7 @@ message schema {
                 deletes: vec![],
                 partition: None,
                 partition_spec: None,
+            name_mapping: None,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -3537,6 +3549,7 @@ message schema {
                 deletes: vec![],
                 partition: None,
                 partition_spec: None,
+            name_mapping: None,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -3632,6 +3645,7 @@ message schema {
                 deletes: vec![],
                 partition: None,
                 partition_spec: None,
+            name_mapping: None,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -3740,6 +3754,7 @@ message schema {
                 deletes: vec![],
                 partition: None,
                 partition_spec: None,
+            name_mapping: None,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -3878,6 +3893,7 @@ message schema {
                 deletes: vec![],
                 partition: Some(partition_data),
                 partition_spec: Some(partition_spec),
+                name_mapping: None,
             })]
             .into_iter(),
         )) as FileScanTaskStream;

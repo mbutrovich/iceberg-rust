@@ -1782,6 +1782,7 @@ pub mod tests {
             deletes: vec![],
             partition: None,
             partition_spec: None,
+            name_mapping: None,
         };
         test_fn(task);
 
@@ -1798,6 +1799,7 @@ pub mod tests {
             deletes: vec![],
             partition: None,
             partition_spec: None,
+            name_mapping: None,
         };
         test_fn(task);
     }
