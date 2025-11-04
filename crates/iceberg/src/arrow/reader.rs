@@ -1962,7 +1962,6 @@ message schema {
                 predicate: Some(predicate.bind(schema, true).unwrap()),
                 deletes: vec![],
                 partition: None,
-                partition_spec_id: None,
                 partition_spec: None,
             })]
             .into_iter(),
@@ -2283,7 +2282,6 @@ message schema {
             predicate: None,
             deletes: vec![],
             partition: None,
-            partition_spec_id: None,
             partition_spec: None,
         };
 
@@ -2299,7 +2297,6 @@ message schema {
             predicate: None,
             deletes: vec![],
             partition: None,
-            partition_spec_id: None,
             partition_spec: None,
         };
 
@@ -2431,7 +2428,6 @@ message schema {
                 predicate: None,
                 deletes: vec![],
                 partition: None,
-                partition_spec_id: None,
                 partition_spec: None,
             })]
             .into_iter(),
@@ -2602,7 +2598,6 @@ message schema {
                 equality_ids: None,
             }],
             partition: None,
-            partition_spec_id: None,
             partition_spec: None,
         };
 
@@ -2820,7 +2815,6 @@ message schema {
                 equality_ids: None,
             }],
             partition: None,
-            partition_spec_id: None,
             partition_spec: None,
         };
 
@@ -3032,7 +3026,6 @@ message schema {
                 equality_ids: None,
             }],
             partition: None,
-            partition_spec_id: None,
             partition_spec: None,
         };
 
@@ -3135,7 +3128,6 @@ message schema {
                 predicate: None,
                 deletes: vec![],
                 partition: None,
-                partition_spec_id: None,
                 partition_spec: None,
             })]
             .into_iter(),
@@ -3232,7 +3224,6 @@ message schema {
                 predicate: None,
                 deletes: vec![],
                 partition: None,
-                partition_spec_id: None,
                 partition_spec: None,
             })]
             .into_iter(),
@@ -3318,7 +3309,6 @@ message schema {
                 predicate: None,
                 deletes: vec![],
                 partition: None,
-                partition_spec_id: None,
                 partition_spec: None,
             })]
             .into_iter(),
@@ -3418,7 +3408,6 @@ message schema {
                 predicate: None,
                 deletes: vec![],
                 partition: None,
-                partition_spec_id: None,
                 partition_spec: None,
             })]
             .into_iter(),
@@ -3547,7 +3536,6 @@ message schema {
                 predicate: None,
                 deletes: vec![],
                 partition: None,
-                partition_spec_id: None,
                 partition_spec: None,
             })]
             .into_iter(),
@@ -3643,7 +3631,6 @@ message schema {
                 predicate: None,
                 deletes: vec![],
                 partition: None,
-                partition_spec_id: None,
                 partition_spec: None,
             })]
             .into_iter(),
@@ -3752,7 +3739,6 @@ message schema {
                 predicate: Some(predicate.bind(schema, true).unwrap()),
                 deletes: vec![],
                 partition: None,
-                partition_spec_id: None,
                 partition_spec: None,
             })]
             .into_iter(),
@@ -3891,7 +3877,6 @@ message schema {
                 predicate: None,
                 deletes: vec![],
                 partition: Some(partition_data),
-                partition_spec_id: Some(0),
                 partition_spec: Some(partition_spec),
             })]
             .into_iter(),

@@ -342,7 +342,6 @@ pub(crate) mod tests {
                 predicate: None,
                 deletes: vec![pos_del_1, pos_del_2.clone()],
                 partition: None,
-                partition_spec_id: None,
                 partition_spec: None,
             },
             FileScanTask {
@@ -356,7 +355,6 @@ pub(crate) mod tests {
                 predicate: None,
                 deletes: vec![pos_del_3],
                 partition: None,
-                partition_spec_id: None,
                 partition_spec: None,
             },
         ];
