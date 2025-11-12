@@ -1016,6 +1016,9 @@ mod tests {
             project_field_ids: vec![1, 2], // id and binary_col
             predicate: None,
             deletes: vec![eq_del],
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
         };
 
         let delete_file_loader = CachingDeleteFileLoader::new(file_io.clone(), 10);
