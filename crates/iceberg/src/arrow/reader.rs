@@ -4470,35 +4470,24 @@ message schema {
 
         // First call should load and cache metadata
         let _metadata1 = ArrowReader::load_parquet_metadata(
-            &file_path,
-            &file_io,
-            false, // should_load_page_index
-            None,
-            &cache,
+            &file_path, &file_io, false, // should_load_page_index
+            None, &cache,
         )
         .await
         .unwrap();
         assert_eq!(cache.len(), 1);
 
         // Second call with same parameters should hit cache
-        let _metadata2 = ArrowReader::load_parquet_metadata(
-            &file_path,
-            &file_io,
-            false,
-            None,
-            &cache,
-        )
-        .await
-        .unwrap();
+        let _metadata2 =
+            ArrowReader::load_parquet_metadata(&file_path, &file_io, false, None, &cache)
+                .await
+                .unwrap();
         assert_eq!(cache.len(), 1); // Still 1 - cache hit
 
         // Third call with different should_load_page_index creates new cache entry
         let _metadata3 = ArrowReader::load_parquet_metadata(
-            &file_path,
-            &file_io,
-            true, // Different should_load_page_index
-            None,
-            &cache,
+            &file_path, &file_io, true, // Different should_load_page_index
+            None, &cache,
         )
         .await
         .unwrap();
