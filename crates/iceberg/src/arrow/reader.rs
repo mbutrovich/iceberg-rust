@@ -556,6 +556,7 @@ impl ArrowReader {
                 let mut temp_reader = ArrowFileReader::new(file_metadata, parquet_reader)
                     .with_preload_column_index(true)
                     .with_preload_offset_index(true)
+                    .with_metadata_size_hint(512 * 1024)
                     .with_preload_page_index(should_load_page_index);
 
                 let temp_arrow_metadata =
