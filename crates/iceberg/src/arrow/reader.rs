@@ -20,7 +20,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::str::FromStr;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use arrow_arith::boolean::{and, and_kleene, is_not_null, is_null, not, or, or_kleene};
 use arrow_array::{Array, ArrayRef, BooleanArray, Datum as ArrowDatum, RecordBatch, Scalar};
@@ -43,7 +43,6 @@ use parquet::file::metadata::{
     PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader, RowGroupMetaData,
 };
 use parquet::schema::types::{SchemaDescriptor, Type as ParquetType};
-use tokio::sync::Notify;
 
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
@@ -61,92 +60,40 @@ use crate::spec::{Datum, NameMapping, NestedField, PrimitiveType, Schema, Type};
 use crate::utils::available_parallelism;
 use crate::{Error, ErrorKind};
 
-/// State for cached Parquet metadata
-/// Modeled after PosDelState in delete_filter.rs
-enum MetadataCacheState {
-    /// Metadata is currently being loaded by another task
-    Loading(Arc<Notify>),
-    /// Metadata has been loaded
-    Loaded(Arc<ParquetMetaData>),
+const DEFAULT_PARQUET_METADATA_CACHE_SIZE: u64 = 16;
+
+/// LRU cache for Parquet file metadata, shared across concurrent FileScanTasks.
+/// Uses moka for bounded, thread-safe caching with automatic eviction.
+/// Cache key is (file_path, should_load_page_index) since metadata content differs.
+#[derive(Clone)]
+pub(crate) struct ParquetMetadataCache {
+    cache: moka::future::Cache<(String, bool), Arc<ParquetMetaData>>,
 }
 
-/// Cache for Parquet file metadata, shared across concurrent FileScanTasks
-/// Prevents redundant metadata loading when multiple tasks reference the same file.
-/// Cache key is (file_path, should_load_page_index) since metadata content differs.
-#[derive(Clone, Default)]
-pub(crate) struct ParquetMetadataCache {
-    state: Arc<RwLock<HashMap<(String, bool), MetadataCacheState>>>,
+impl Default for ParquetMetadataCache {
+    fn default() -> Self {
+        Self {
+            cache: moka::future::Cache::new(DEFAULT_PARQUET_METADATA_CACHE_SIZE),
+        }
+    }
 }
 
 impl std::fmt::Debug for ParquetMetadataCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ParquetMetadataCache")
-            .field("cached_entries", &self.state.read().unwrap().len())
+            .field("cached_entries", &self.cache.entry_count())
             .finish()
     }
 }
 
-/// Action to take when trying to get or load metadata
-/// Modeled after PosDelLoadAction in delete_filter.rs
-pub(crate) enum MetadataLoadAction {
-    /// Metadata is already loaded
-    Loaded(Arc<ParquetMetaData>),
-    /// Metadata is being loaded by another task - wait for notification
-    WaitFor(Arc<Notify>),
-    /// Caller should load the metadata
-    Load,
-}
-
 impl ParquetMetadataCache {
-    /// Try to get cached metadata or determine if we should load it
-    pub(crate) fn try_get_or_start_loading(
-        &self,
-        file_path: &str,
-        load_page_index: bool,
-    ) -> MetadataLoadAction {
-        let mut state = self.state.write().unwrap();
-        let key = (file_path.to_string(), load_page_index);
-
-        if let Some(cached) = state.get(&key) {
-            return match cached {
-                MetadataCacheState::Loaded(metadata) => {
-                    MetadataLoadAction::Loaded(Arc::clone(metadata))
-                }
-                MetadataCacheState::Loading(notify) => {
-                    MetadataLoadAction::WaitFor(Arc::clone(notify))
-                }
-            };
-        }
-
-        // Mark as loading to prevent duplicate work
-        let notify = Arc::new(Notify::new());
-        state.insert(key, MetadataCacheState::Loading(Arc::clone(&notify)));
-
-        MetadataLoadAction::Load
-    }
-
-    /// Store loaded metadata and notify waiters
-    pub(crate) fn finish_loading(
-        &self,
-        file_path: &str,
-        load_page_index: bool,
-        metadata: Arc<ParquetMetaData>,
-    ) {
-        let mut state = self.state.write().unwrap();
-        let key = (file_path.to_string(), load_page_index);
-
-        // Get the notify handle before replacing
-        if let Some(MetadataCacheState::Loading(notify)) = state.get(&key) {
-            notify.notify_waiters();
-        }
-
-        state.insert(key, MetadataCacheState::Loaded(metadata));
-    }
-
-    /// Returns the number of cached entries (for testing)
+    /// Returns the number of cached entries (for testing).
+    /// Runs pending tasks first to ensure the count is up-to-date,
+    /// since moka updates entry counts asynchronously.
     #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
-        self.state.read().unwrap().len()
+    pub(crate) async fn entry_count(&self) -> u64 {
+        self.cache.run_pending_tasks().await;
+        self.cache.entry_count()
     }
 }
 
@@ -594,44 +541,35 @@ impl ArrowReader {
         file_size: Option<u64>,
         metadata_cache: &ParquetMetadataCache,
     ) -> Result<Arc<ParquetMetaData>> {
+        let key = (data_file_path.to_string(), should_load_page_index);
         let parquet_file = file_io.new_input(data_file_path)?;
 
-        loop {
-            match metadata_cache.try_get_or_start_loading(data_file_path, should_load_page_index) {
-                MetadataLoadAction::Loaded(metadata) => break Ok(metadata),
-                MetadataLoadAction::WaitFor(notify) => {
-                    notify.notified().await;
-                }
-                MetadataLoadAction::Load => {
-                    let (file_metadata, parquet_reader) = if let Some(size) = file_size {
-                        let reader = parquet_file.reader().await?;
-                        (FileMetadata { size }, reader)
-                    } else {
-                        try_join!(parquet_file.metadata(), parquet_file.reader())?
-                    };
-                    let mut temp_reader = ArrowFileReader::new(file_metadata, parquet_reader)
-                        .with_preload_column_index(true)
-                        .with_preload_offset_index(true)
-                        .with_preload_page_index(should_load_page_index);
+        metadata_cache
+            .cache
+            .try_get_with(key, async {
+                let (file_metadata, parquet_reader) = if let Some(size) = file_size {
+                    let reader = parquet_file.reader().await?;
+                    (FileMetadata { size }, reader)
+                } else {
+                    try_join!(parquet_file.metadata(), parquet_file.reader())?
+                };
+                let mut temp_reader = ArrowFileReader::new(file_metadata, parquet_reader)
+                    .with_preload_column_index(true)
+                    .with_preload_offset_index(true)
+                    .with_preload_page_index(should_load_page_index);
 
-                    let temp_arrow_metadata =
-                        ArrowReaderMetadata::load_async(&mut temp_reader, Default::default())
-                            .await
-                            .map_err(|e| {
-                                Error::new(ErrorKind::Unexpected, "Failed to load Parquet metadata")
-                                    .with_source(e)
-                            })?;
+                let temp_arrow_metadata =
+                    ArrowReaderMetadata::load_async(&mut temp_reader, Default::default())
+                        .await
+                        .map_err(|e| {
+                            Error::new(ErrorKind::Unexpected, "Failed to load Parquet metadata")
+                                .with_source(e)
+                        })?;
 
-                    let metadata = Arc::clone(temp_arrow_metadata.metadata());
-                    metadata_cache.finish_loading(
-                        data_file_path,
-                        should_load_page_index,
-                        Arc::clone(&metadata),
-                    );
-                    break Ok(metadata);
-                }
-            }
-        }
+                Ok(Arc::clone(temp_arrow_metadata.metadata())) as Result<Arc<ParquetMetaData>>
+            })
+            .await
+            .map_err(|e| Error::new(ErrorKind::Unexpected, e.to_string()))
     }
 
     pub(crate) async fn create_parquet_record_batch_stream_builder(
@@ -4466,7 +4404,7 @@ message schema {
 
         // Create a shared cache
         let cache = ParquetMetadataCache::default();
-        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.entry_count().await, 0);
 
         // First call should load and cache metadata
         let _metadata1 = ArrowReader::load_parquet_metadata(
@@ -4475,14 +4413,14 @@ message schema {
         )
         .await
         .unwrap();
-        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.entry_count().await, 1);
 
         // Second call with same parameters should hit cache
         let _metadata2 =
             ArrowReader::load_parquet_metadata(&file_path, &file_io, false, None, &cache)
                 .await
                 .unwrap();
-        assert_eq!(cache.len(), 1); // Still 1 - cache hit
+        assert_eq!(cache.entry_count().await, 1); // Still 1 - cache hit
 
         // Third call with different should_load_page_index creates new cache entry
         let _metadata3 = ArrowReader::load_parquet_metadata(
@@ -4491,6 +4429,6 @@ message schema {
         )
         .await
         .unwrap();
-        assert_eq!(cache.len(), 2); // Now 2 - different key
+        assert_eq!(cache.entry_count().await, 2); // Now 2 - different key
     }
 }
