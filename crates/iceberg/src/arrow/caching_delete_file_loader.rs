@@ -1284,11 +1284,7 @@ mod tests {
         );
 
         let loader = CachingDeleteFileLoader::new(file_io, 10, Runtime::current());
-        let delete_filter = loader
-            .load_deletes(&[dv], schema)
-            .await
-            .unwrap()
-            .unwrap();
+        let delete_filter = loader.load_deletes(&[dv], schema).await.unwrap().unwrap();
 
         let delete_vector = delete_filter
             .get_delete_vector_for_path(&data_file_path)

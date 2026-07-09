@@ -47,7 +47,10 @@ struct PopulatedDeleteFileIndex {
     // TODO: do we need this?
     // pos_deletes_by_path: HashMap<String, Vec<Arc<DeleteFileContext>>>,
 
-    // TODO: Deletion Vector support
+    // V3 deletion vectors, keyed by the data file they apply to (referenced_data_file). At most
+    // one exists per data file per snapshot, and when one applies it supersedes any position
+    // delete files for that data file.
+    dvs_by_referenced_data_file: HashMap<String, Arc<DeleteFileContext>>,
 }
 
 impl DeleteFileIndex {
@@ -128,11 +131,26 @@ impl PopulatedDeleteFileIndex {
             HashMap::default();
 
         let mut global_equality_deletes: Vec<Arc<DeleteFileContext>> = vec![];
+        let mut dvs_by_referenced_data_file: HashMap<String, Arc<DeleteFileContext>> =
+            HashMap::default();
 
         files.into_iter().for_each(|ctx| {
             let arc_ctx = Arc::new(ctx);
 
-            let partition = arc_ctx.manifest_entry.data_file().partition();
+            let data_file = arc_ctx.manifest_entry.data_file();
+            let content_offset = data_file.content_offset();
+            let referenced_data_file = data_file.referenced_data_file();
+            let partition = data_file.partition().clone();
+
+            // A V3 deletion vector is a positional delete stored as a Puffin blob (content_offset
+            // set) scoped to a single data file via referenced_data_file. Index it by that data
+            // file so it can supersede position delete files at lookup time.
+            if content_offset.is_some() {
+                if let Some(referenced_data_file) = referenced_data_file {
+                    dvs_by_referenced_data_file.insert(referenced_data_file, arc_ctx);
+                    return;
+                }
+            }
 
             // The spec states that "Equality delete files stored with an unpartitioned spec are applied as global deletes".
             if partition.fields().is_empty() {
@@ -150,7 +168,7 @@ impl PopulatedDeleteFileIndex {
             };
 
             destination_map
-                .entry(partition.clone())
+                .entry(partition)
                 .and_modify(|entry| {
                     entry.push(arc_ctx.clone());
                 })
@@ -161,6 +179,7 @@ impl PopulatedDeleteFileIndex {
             global_equality_deletes,
             eq_deletes_by_partition,
             pos_deletes_by_partition,
+            dvs_by_referenced_data_file,
         }
     }
 
@@ -193,6 +212,19 @@ impl PopulatedDeleteFileIndex {
                         && data_file.partition_spec_id == delete.partition_spec_id
                 })
                 .for_each(|delete| results.push(delete.as_ref().into()));
+        }
+
+        // A deletion vector supersedes position delete files for its data file. When one applies,
+        // return it in place of any position delete files. Equality deletes still apply.
+        if let Some(dv) = self.dvs_by_referenced_data_file.get(data_file.file_path()) {
+            let applies = seq_num
+                .map(|seq_num| dv.manifest_entry.sequence_number() >= Some(seq_num))
+                .unwrap_or(true)
+                && data_file.partition_spec_id == dv.partition_spec_id;
+            if applies {
+                results.push(dv.as_ref().into());
+                return results;
+            }
         }
 
         // TODO: the spec states that:
@@ -451,6 +483,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn deletion_vector_supersedes_position_deletes() {
+        let partition = Struct::from_iter([Some(Literal::long(100))]);
+        let spec_id = 1;
+        let data_file = build_partitioned_data_file(&partition, spec_id);
+
+        let dv = build_deletion_vector(data_file.file_path(), &partition, spec_id);
+        let dv_path = dv.file_path().to_string();
+        let pos_del = build_partitioned_pos_delete(&partition, spec_id);
+
+        let contexts = vec![
+            DeleteFileContext {
+                manifest_entry: build_added_manifest_entry(5, &dv).into(),
+                partition_spec_id: spec_id,
+            },
+            DeleteFileContext {
+                manifest_entry: build_added_manifest_entry(5, &pos_del).into(),
+                partition_spec_id: spec_id,
+            },
+        ];
+
+        let index = PopulatedDeleteFileIndex::new(contexts);
+        let applied: Vec<String> = index
+            .get_deletes_for_data_file(&data_file, Some(0))
+            .into_iter()
+            .map(|f| f.file_path)
+            .collect();
+
+        // Only the deletion vector applies; the position delete file is superseded.
+        assert_eq!(applied, vec![dv_path]);
+    }
+
     fn build_unpartitioned_eq_delete() -> DataFile {
         build_partitioned_eq_delete(&Struct::empty(), 0)
     }
@@ -483,6 +547,28 @@ mod tests {
             .partition(partition.clone())
             .partition_spec_id(spec_id)
             .file_size_in_bytes(100)
+            .build()
+            .unwrap()
+    }
+
+    // A V3 deletion vector: a PositionDeletes entry stored as a Puffin blob (content_offset set)
+    // scoped to a single data file via referenced_data_file.
+    fn build_deletion_vector(
+        referenced_data_file: &str,
+        partition: &Struct,
+        spec_id: i32,
+    ) -> DataFile {
+        DataFileBuilder::default()
+            .file_path(format!("{}-deletes.puffin", Uuid::new_v4()))
+            .file_format(DataFileFormat::Puffin)
+            .content(DataContentType::PositionDeletes)
+            .record_count(1)
+            .referenced_data_file(Some(referenced_data_file.to_string()))
+            .content_offset(Some(4))
+            .content_size_in_bytes(Some(40))
+            .partition(partition.clone())
+            .partition_spec_id(spec_id)
+            .file_size_in_bytes(60)
             .build()
             .unwrap()
     }

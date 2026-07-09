@@ -503,6 +503,120 @@ mod tests {
         );
     }
 
+    /// End-to-end read of a data file with a V3 deletion vector applied. Exercises the whole
+    /// deletion-vector read path together: the DV coordinates on the scan task, the loader
+    /// reading the blob by range from its Puffin file, decoding it with DeleteVector::deserialize,
+    /// and ArrowReader filtering the deleted rows.
+    #[tokio::test]
+    async fn test_deletion_vector_applied_end_to_end() {
+        use arrow_array::Int32Array;
+
+        let tmp_dir = TempDir::new().unwrap();
+        let table_location = tmp_dir.path().to_str().unwrap().to_string();
+
+        let table_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        ]));
+
+        // Data file: ids 1..=5 at positions 0..=4.
+        let data_file_path = format!("{table_location}/data.parquet");
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
+            Int32Array::from_iter_values(1..=5),
+        )])
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build();
+        let file = File::create(&data_file_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, arrow_schema.clone(), Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        // Deletion vector deleting positions 1 and 3 (ids 2 and 4), serialized as a
+        // deletion-vector-v1 blob and embedded in a Puffin-like file at a non-zero offset.
+        let mut bitmap = RoaringTreemap::new();
+        bitmap.insert(1);
+        bitmap.insert(3);
+        let mut vector = Vec::new();
+        bitmap.serialize_into(&mut vector).unwrap();
+        let body_len = (4 + vector.len()) as u32;
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&body_len.to_be_bytes());
+        blob.extend_from_slice(&[0xD1, 0xD3, 0x39, 0x64]);
+        blob.extend_from_slice(&vector);
+        let crc = crc32fast::hash(&blob[4..]);
+        blob.extend_from_slice(&crc.to_be_bytes());
+
+        let content_offset = 12i64;
+        let content_size = blob.len() as i64;
+        let mut dv_file_bytes = vec![0u8; content_offset as usize];
+        dv_file_bytes.extend_from_slice(&blob);
+        let dv_path = format!("{table_location}/deletes.puffin");
+        std::fs::write(&dv_path, &dv_file_bytes).unwrap();
+
+        let file_io = FileIO::new_with_fs();
+        let reader = ArrowReaderBuilder::new(file_io, Runtime::current()).build();
+
+        let task = FileScanTask::builder()
+            .with_file_size_in_bytes(std::fs::metadata(&data_file_path).unwrap().len())
+            .with_start(0)
+            .with_length(0)
+            .with_record_count(Some(5))
+            .with_data_file_path(data_file_path.clone())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(table_schema.clone())
+            .with_project_field_ids(vec![1])
+            .with_deletes(vec![
+                FileScanTaskDeleteFile::builder()
+                    .with_file_path(dv_path.clone())
+                    .with_file_size_in_bytes(std::fs::metadata(&dv_path).unwrap().len())
+                    .with_file_type(DataContentType::PositionDeletes)
+                    .with_partition_spec_id(0)
+                    .with_referenced_data_file(Some(data_file_path.clone()))
+                    .with_content_offset(Some(content_offset))
+                    .with_content_size_in_bytes(Some(content_size))
+                    .build(),
+            ])
+            .with_case_sensitive(false)
+            .build();
+
+        let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
+        let result = reader
+            .read(tasks)
+            .unwrap()
+            .stream()
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .unwrap();
+
+        let ids: Vec<i32> = result
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<arrow_array::types::Int32Type>()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+
+        // Positions 1 and 3 (ids 2 and 4) are deleted; ids 1, 3, 5 remain.
+        assert_eq!(ids, vec![1, 3, 5]);
+    }
+
     /// Test for bug where position deletes are lost when skipping unselected row groups.
     ///
     /// This is a variant of `test_position_delete_across_multiple_row_groups` that exercises
