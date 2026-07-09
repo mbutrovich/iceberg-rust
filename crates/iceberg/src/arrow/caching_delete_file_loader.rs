@@ -19,6 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, Int64Array, StringArray, StructArray};
+use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use tokio::sync::oneshot::{Receiver, channel};
 
@@ -51,7 +52,6 @@ pub(crate) struct CachingDeleteFileLoader {
 
 // Intermediate context during processing of a delete file task.
 enum DeleteFileContext {
-    // TODO: Delete Vector loader from Puffin files
     ExistingEqDel,
     ExistingPosDel,
     PosDels {
@@ -63,6 +63,12 @@ enum DeleteFileContext {
         equality_ids: HashSet<i32>,
         sender: tokio::sync::oneshot::Sender<Predicate>,
     },
+    // A V3 deletion vector: the raw deletion-vector-v1 blob bytes and the data file whose rows
+    // it deletes. The blob is decoded in the parse phase.
+    DelVec {
+        data_file_path: String,
+        blob: Bytes,
+    },
 }
 
 // Final result of the processing of a delete file task before
@@ -71,6 +77,11 @@ enum ParsedDeleteFileContext {
     DelVecs {
         file_path: String,
         results: HashMap<String, DeleteVector>,
+    },
+    // A single deletion vector decoded from a Puffin blob, keyed by the data file it applies to.
+    DelVec {
+        data_file_path: String,
+        delete_vector: DeleteVector,
     },
     EqDel,
     ExistingPosDel,
@@ -211,13 +222,22 @@ impl CachingDeleteFileLoader {
                     .try_buffer_unordered(concurrency_limit_data_files);
 
                 while let Some(item) = results_stream.next().await {
-                    let item = item?;
-                    if let ParsedDeleteFileContext::DelVecs { file_path, results } = item {
-                        for (data_file_path, delete_vector) in results.into_iter() {
+                    match item? {
+                        ParsedDeleteFileContext::DelVecs { file_path, results } => {
+                            for (data_file_path, delete_vector) in results.into_iter() {
+                                del_filter.upsert_delete_vector(data_file_path, delete_vector);
+                            }
+                            // Mark the positional delete file as fully loaded so waiters can proceed
+                            del_filter.finish_pos_del_load(&file_path);
+                        }
+                        ParsedDeleteFileContext::DelVec {
+                            data_file_path,
+                            delete_vector,
+                        } => {
                             del_filter.upsert_delete_vector(data_file_path, delete_vector);
                         }
-                        // Mark the positional delete file as fully loaded so waiters can proceed
-                        del_filter.finish_pos_del_load(&file_path);
+                        ParsedDeleteFileContext::EqDel
+                        | ParsedDeleteFileContext::ExistingPosDel => {}
                     }
                 }
 
@@ -239,6 +259,17 @@ impl CachingDeleteFileLoader {
     ) -> Result<DeleteFileContext> {
         match task.file_type {
             DataContentType::PositionDeletes => {
+                // A V3 deletion vector arrives as a PositionDeletes entry whose deletes live in a
+                // Puffin blob located by content_offset, not in a positional-delete parquet file.
+                if let Some(content_offset) = task.content_offset {
+                    return Self::load_deletion_vector(
+                        task,
+                        content_offset,
+                        basic_delete_file_loader,
+                    )
+                    .await;
+                }
+
                 match del_filter.try_start_pos_del_load(&task.file_path) {
                     PosDelLoadAction::AlreadyLoaded => Ok(DeleteFileContext::ExistingPosDel),
                     PosDelLoadAction::WaitFor(notify) => {
@@ -291,12 +322,84 @@ impl CachingDeleteFileLoader {
         }
     }
 
+    /// Reads a V3 deletion vector blob directly from its Puffin file.
+    ///
+    /// The spec requires a delete manifest entry's `content_offset` / `content_size_in_bytes` to
+    /// match the blob's offset and length in the Puffin footer, so the blob is read by range
+    /// without parsing the footer. It is decoded into a [`DeleteVector`] in the parse phase.
+    async fn load_deletion_vector(
+        task: &FileScanTaskDeleteFile,
+        content_offset: i64,
+        basic_delete_file_loader: BasicDeleteFileLoader,
+    ) -> Result<DeleteFileContext> {
+        let content_size = task.content_size_in_bytes.ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "deletion vector {} sets content_offset but not content_size_in_bytes",
+                    task.file_path
+                ),
+            )
+        })?;
+        let data_file_path = task.referenced_data_file.clone().ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "deletion vector {} is missing referenced_data_file",
+                    task.file_path
+                ),
+            )
+        })?;
+
+        let start = u64::try_from(content_offset).map_err(|_| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "deletion vector {} has negative content_offset {content_offset}",
+                    task.file_path
+                ),
+            )
+        })?;
+        let len = u64::try_from(content_size).map_err(|_| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "deletion vector {} has negative content_size_in_bytes {content_size}",
+                    task.file_path
+                ),
+            )
+        })?;
+
+        let blob = basic_delete_file_loader
+            .file_io()
+            .new_input(&task.file_path)?
+            .reader()
+            .await?
+            .read(start..start + len)
+            .await?;
+
+        Ok(DeleteFileContext::DelVec {
+            data_file_path,
+            blob,
+        })
+    }
+
     async fn parse_file_content_for_task(
         ctx: DeleteFileContext,
     ) -> Result<ParsedDeleteFileContext> {
         match ctx {
             DeleteFileContext::ExistingEqDel => Ok(ParsedDeleteFileContext::EqDel),
             DeleteFileContext::ExistingPosDel => Ok(ParsedDeleteFileContext::ExistingPosDel),
+            DeleteFileContext::DelVec {
+                data_file_path,
+                blob,
+            } => {
+                let delete_vector = DeleteVector::deserialize(&blob)?;
+                Ok(ParsedDeleteFileContext::DelVec {
+                    data_file_path,
+                    delete_vector,
+                })
+            }
             DeleteFileContext::PosDels { file_path, stream } => {
                 let del_vecs = Self::parse_positional_deletes_record_batch_stream(stream).await?;
                 Ok(ParsedDeleteFileContext::DelVecs {
@@ -1123,6 +1226,76 @@ mod tests {
             "Failed to build equality delete predicate: {:?}",
             result.err()
         );
+    }
+
+    #[tokio::test]
+    async fn test_load_deletes_applies_deletion_vector() {
+        use roaring::RoaringTreemap;
+
+        use crate::spec::{NestedField, PrimitiveType, Schema, Type};
+
+        let tmp_dir = TempDir::new().unwrap();
+        let table_location = tmp_dir.path().to_str().unwrap().to_string();
+        let file_io = FileIO::new_with_fs();
+
+        // Build a deletion-vector-v1 blob for positions {0, 1, 5}.
+        let mut bitmap = RoaringTreemap::new();
+        for pos in [0u64, 1, 5] {
+            bitmap.insert(pos);
+        }
+        let mut vector = Vec::new();
+        bitmap.serialize_into(&mut vector).unwrap();
+        let body_len = (4 + vector.len()) as u32;
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&body_len.to_be_bytes());
+        blob.extend_from_slice(&[0xD1, 0xD3, 0x39, 0x64]);
+        blob.extend_from_slice(&vector);
+        let crc = crc32fast::hash(&blob[4..]);
+        blob.extend_from_slice(&crc.to_be_bytes());
+
+        // Embed the blob in a Puffin-like file behind leading bytes so content_offset is non-zero,
+        // then let the loader read it back by range.
+        let content_offset = 12i64;
+        let content_size = blob.len() as i64;
+        let mut file_bytes = vec![0u8; content_offset as usize];
+        file_bytes.extend_from_slice(&blob);
+        file_bytes.extend_from_slice(&[0u8; 8]);
+        let dv_path = format!("{table_location}/deletes.puffin");
+        std::fs::write(&dv_path, &file_bytes).unwrap();
+
+        let data_file_path = format!("{table_location}/data-1.parquet");
+        let dv = FileScanTaskDeleteFile::builder()
+            .with_file_path(dv_path.clone())
+            .with_file_size_in_bytes(std::fs::metadata(&dv_path).unwrap().len())
+            .with_file_type(DataContentType::PositionDeletes)
+            .with_partition_spec_id(0)
+            .with_referenced_data_file(Some(data_file_path.clone()))
+            .with_content_offset(Some(content_offset))
+            .with_content_size_in_bytes(Some(content_size))
+            .build();
+
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "x", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let loader = CachingDeleteFileLoader::new(file_io, 10, Runtime::current());
+        let delete_filter = loader
+            .load_deletes(&[dv], schema)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let delete_vector = delete_filter
+            .get_delete_vector_for_path(&data_file_path)
+            .expect("a delete vector should be indexed for the referenced data file");
+        let mut positions: Vec<u64> = delete_vector.lock().unwrap().iter().collect();
+        positions.sort_unstable();
+        assert_eq!(positions, vec![0, 1, 5]);
     }
 
     #[tokio::test]
