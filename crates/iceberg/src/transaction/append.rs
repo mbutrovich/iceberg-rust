@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -71,6 +71,18 @@ impl FastAppendAction {
         self.snapshot_properties = snapshot_properties;
         self
     }
+
+    /// Collapse files sharing a path to their first occurrence, so a single
+    /// manifest never references the same file twice. Always runs (unlike the
+    /// `check_duplicate`-gated cross-snapshot check) since it is in-memory only.
+    fn dedupe_added_files(&self) -> Vec<DataFile> {
+        let mut seen = HashSet::with_capacity(self.added_data_files.len());
+        self.added_data_files
+            .iter()
+            .filter(|data_file| seen.insert(data_file.file_path.as_str()))
+            .cloned()
+            .collect()
+    }
 }
 
 #[async_trait]
@@ -80,7 +92,7 @@ impl TransactionAction for FastAppendAction {
             table,
             self.commit_uuid.unwrap_or_else(Uuid::now_v7),
             self.snapshot_properties.clone(),
-            self.added_data_files.clone(),
+            self.dedupe_added_files(),
         );
 
         // validate added files
@@ -153,9 +165,9 @@ mod tests {
     use crate::encryption::kms::MemoryKeyManagementClient;
     use crate::io::FileIO;
     use crate::spec::{
-        DataContentType, DataFileBuilder, DataFileFormat, Literal, MAIN_BRANCH, ManifestEntry,
-        ManifestListWriter, ManifestStatus, ManifestWriterBuilder, SnapshotRef, Struct,
-        TableMetadata,
+        DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, MAIN_BRANCH,
+        ManifestEntry, ManifestListWriter, ManifestStatus, ManifestWriterBuilder, SnapshotRef,
+        Struct, TableMetadata,
     };
     use crate::table::Table;
     use crate::test_utils::test_runtime;
@@ -354,12 +366,104 @@ mod tests {
         );
     }
 
+    /// Load the data files written by a single-manifest fast-append commit.
+    async fn committed_data_files(table: &Table, updates: &[TableUpdate]) -> Vec<DataFile> {
+        let TableUpdate::AddSnapshot { snapshot } = &updates[0] else {
+            unreachable!("first update is always AddSnapshot")
+        };
+        let manifest_list = table
+            .manifest_list_reader(&SnapshotRef::new(snapshot.clone()))
+            .load()
+            .await
+            .unwrap();
+        assert_eq!(1, manifest_list.entries().len());
+        manifest_list.entries()[0]
+            .load_manifest(table.file_io())
+            .await
+            .unwrap()
+            .entries()
+            .iter()
+            .map(|entry| entry.data_file().clone())
+            .collect()
+    }
+
     #[tokio::test]
     async fn test_empty_data_append_action() {
         let table = make_v2_minimal_table();
         let tx = Transaction::new(&table);
         let action = tx.fast_append().add_data_files(vec![]);
         assert!(Arc::new(action).commit(&table).await.is_err());
+    }
+
+    /// A `fast_append` must write the manifest list and the manifest
+    /// files under the `write.metadata.path` prefix when configured,
+    /// rather than the default `<location>/metadata` directory.
+    #[tokio::test]
+    async fn test_fast_append_honors_write_metadata_path() {
+        let base = make_v2_minimal_table();
+        let metadata_root = format!("{}/custom-meta", base.metadata().location());
+        let metadata = base
+            .metadata()
+            .clone()
+            .into_builder(None)
+            .set_properties(HashMap::from([(
+                "write.metadata.path".to_string(),
+                metadata_root.clone(),
+            )]))
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let table = base.with_metadata(Arc::new(metadata));
+
+        let data_file = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path(format!("{}/data/1.parquet", table.metadata().location()))
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .build()
+            .unwrap();
+
+        let tx = Transaction::new(&table);
+        let action = tx.fast_append().add_data_files(vec![data_file]);
+        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let updates = action_commit.take_updates();
+
+        let new_snapshot: SnapshotRef = if let TableUpdate::AddSnapshot { snapshot } = &updates[0] {
+            SnapshotRef::new(snapshot.clone())
+        } else {
+            unreachable!("first update of a fast append should be AddSnapshot")
+        };
+
+        let prefix = format!("{metadata_root}/");
+
+        // Manifest list
+        assert!(
+            new_snapshot.manifest_list().starts_with(prefix.as_str()),
+            "manifest list {} not under configured write.metadata.path {metadata_root}",
+            new_snapshot.manifest_list()
+        );
+
+        // Manifest files
+        let manifest_list = table
+            .manifest_list_reader(&new_snapshot)
+            .load()
+            .await
+            .unwrap();
+        assert!(
+            !manifest_list.entries().is_empty(),
+            "expected at least one manifest entry"
+        );
+        for entry in manifest_list.entries() {
+            assert!(
+                entry.manifest_path.starts_with(prefix.as_str()),
+                "manifest {} not under configured write.metadata.path {metadata_root}",
+                entry.manifest_path
+            );
+        }
     }
 
     #[tokio::test]
@@ -618,6 +722,64 @@ mod tests {
         let action = action.add_data_files(vec![data_file.clone()]);
 
         assert!(Arc::new(action).commit(&table).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_fast_append_dedupes_intra_batch_duplicate_paths() {
+        let table = make_v2_minimal_table();
+        let tx = Transaction::new(&table);
+
+        let make_file = |size: u64, records: u64| {
+            DataFileBuilder::default()
+                .content(DataContentType::Data)
+                .file_path("test/dup.parquet".to_string())
+                .file_format(DataFileFormat::Parquet)
+                .file_size_in_bytes(size)
+                .record_count(records)
+                .partition_spec_id(table.metadata().default_partition_spec_id())
+                .partition(Struct::from_iter([Some(Literal::long(1))]))
+                .build()
+                .unwrap()
+        };
+
+        // Same path three times: the manifest keeps a single entry, the first one.
+        let action = tx.fast_append().add_data_files(vec![
+            make_file(100, 10),
+            make_file(200, 20),
+            make_file(300, 30),
+        ]);
+        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let files = committed_data_files(&table, &action_commit.take_updates()).await;
+        assert_eq!(1, files.len());
+        assert_eq!(100, files[0].file_size_in_bytes());
+    }
+
+    #[tokio::test]
+    async fn test_fast_append_dedupes_regardless_of_check_duplicate_flag() {
+        let table = make_v2_minimal_table();
+        let tx = Transaction::new(&table);
+
+        let make_file = || {
+            DataFileBuilder::default()
+                .content(DataContentType::Data)
+                .file_path("test/dup.parquet".to_string())
+                .file_format(DataFileFormat::Parquet)
+                .file_size_in_bytes(100)
+                .record_count(10)
+                .partition_spec_id(table.metadata().default_partition_spec_id())
+                .partition(Struct::from_iter([Some(Literal::long(1))]))
+                .build()
+                .unwrap()
+        };
+
+        // `check_duplicate` only gates the cross-snapshot check; intra-batch dedupe runs regardless.
+        let action = tx
+            .fast_append()
+            .with_check_duplicate(false)
+            .add_data_files(vec![make_file(), make_file()]);
+        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let files = committed_data_files(&table, &action_commit.take_updates()).await;
+        assert_eq!(1, files.len());
     }
 
     #[tokio::test]
